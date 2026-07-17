@@ -35,8 +35,10 @@ Success criteria (Part 1 is "done" when all hold on the test clip, using one sav
    tuner and the overlay reproduce the result from that file.
 
 Explicitly out of scope for Part 1 (do not implement): any neural network, YOLO,
-trained gate model, tracking across frames, or control/flight logic. A trained
-gate detector is Part 2.
+trained gate model, PnP / pose estimation, tracking across frames, state
+estimation, or control/flight logic. Part 1 detects and outlines gates and
+produces their corner points; consuming those corners (PnP for drone localization)
+and replacing the color mask with a trained segmentation network are Part 2.
 
 --------------------------------------------------------------------------------
 
@@ -68,24 +70,43 @@ For one BGR frame:
    `cv2.bitwise_or`. If no band is enabled, the mask is all zeros.
 5. Clean the mask: `MORPH_CLOSE` then `MORPH_OPEN` with an elliptical kernel of
    size `(morph_kernel, morph_kernel)`.
-6. `cv2.findContours(mask, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)`.
-7. For each contour, compute candidate metrics:
+6. Find contours WITH hierarchy so gate windows are available:
+   `contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)`.
+   RETR_CCOMP gives two levels: outer boundaries (level 0) and holes (level 1). A
+   gate frame is a colored ring, so its outer edge is a level-0 contour and its
+   window is that contour's level-1 hole.
+7. For each LEVEL-0 contour, compute candidate metrics:
    - `area = cv2.contourArea(contour)`; `area_frac = area / (proc_w * proc_h)`.
    - Reject immediately if `area_frac < min_area_frac`.
    - `rect = cv2.minAreaRect(contour)` -> `(cx, cy), (w, h), angle`.
    - `aspect = max(w, h) / max(min(w, h), 1e-6)`.
    - `hull = cv2.convexHull(contour)`; `solidity = area / max(cv2.contourArea(hull), 1e-6)`.
-   - `corners = cv2.boxPoints(rect)` (4 points).
-8. Validate the candidate (all must hold, else reject):
+8. Corner extraction (the important stage — these corners are what a future PnP
+   pose solver will consume, so find the TRUE gate quadrilateral, not a box):
+   - Outer corners: `peri = cv2.arcLength(contour, True)`;
+     `approx = cv2.approxPolyDP(contour, approx_epsilon_frac * peri, True)`.
+     If `len(approx) == 4`: `outer_corners = order_corners(approx.reshape(4, 2))`.
+     Otherwise fall back to `outer_corners = order_corners(cv2.boxPoints(rect))`.
+   - Inner corners (only if `find_inner_corners`): using `hierarchy`, take this
+     contour's largest child hole (a level-1 contour whose parent is this one),
+     approxPolyDP it the same way; if it yields exactly 4 points set
+     `inner_corners = order_corners(...)`, else `inner_corners = None`.
+   - `order_corners(pts)` returns the 4 points in the fixed order
+     [top-left, top-right, bottom-right, bottom-left]: sort the 4 points by y; of
+     the two smallest-y (top) order by x -> TL, TR; of the two largest-y (bottom)
+     order by x -> BL, BR; return [TL, TR, BR, BL]. A fixed order is required so PnP
+     can match image corners to known 3D corners later.
+9. Validate the candidate (all must hold, else reject):
    - `min_aspect <= aspect <= max_aspect`.
    - `solidity >= min_solidity`.
-9. Confidence (0..1):
+10. Confidence (0..1):
    - `size_score = min(1.0, area_frac / 0.02)` (a gate at >=2% of the frame scores
      full on size).
    - `confidence = 0.5 * solidity + 0.5 * size_score`.
    - Keep the gate only if `confidence >= confidence_threshold`.
-10. Build the gate result. Scale `corners`, center `(cx, cy)`, and the bounding box
-    back to the ORIGINAL frame size using the scale factor from step 1.
+11. Build the gate result. Scale `outer_corners`, `inner_corners` (if any), center
+    `(cx, cy)`, and the bounding box back to the ORIGINAL frame size using the scale
+    factor from step 1.
 
 Sort gates by `area_frac` descending (closest first). Return them.
 
@@ -94,11 +115,15 @@ Gate result dict keys (the overlay expects these; keep names exact):
 x1, y1, x2, y2          # axis-aligned bbox of the corners, original-frame pixels
 width, height           # bbox size
 center_x, center_y      # gate center, original-frame pixels
-corners                 # np.ndarray shape (4,2), original-frame pixels
+corners                 # np.ndarray (4,2) outer corners, ordered TL,TR,BR,BL, original px
+inner_corners           # np.ndarray (4,2) ordered, or None
 confidence              # float 0..1
 band                    # "A" or "B" or "A+B": which band(s) contributed most
 aspect, solidity, area_frac   # metrics, for display/debug
 ```
+The `corners` (outer) plus `inner_corners` are the up-to-8 image points a Part 2
+PnP stage will pair with the known 3D gate corners to localize the drone. Part 1
+only produces and validates them; it does not solve PnP.
 
 --------------------------------------------------------------------------------
 
@@ -130,14 +155,16 @@ Unknown keys in a loaded file are ignored; missing keys keep defaults.
 ```
 def preprocess(self, bgr) -> bgr
 def color_mask(self, bgr) -> (mask uint8, band_a_mask uint8, band_b_mask uint8)
-def candidates(self, mask) -> list[dict]     # steps 6-9, in proc space
+def order_corners(self, pts) -> np.ndarray   # 4 points -> [TL,TR,BR,BL]
+def candidates(self, mask) -> list[dict]     # steps 6-10, in proc space
 ```
-`candidates` returns per-contour dicts with keys: `corners` (proc space),
-`center`, `bbox`, `aspect`, `solidity`, `area_frac`, `confidence`, `band`,
-`passed` (bool: passed validation AND confidence threshold), and `reject_reason`
-(str: "" if passed, else one of "area", "aspect", "solidity", "confidence").
-Determine `band` by which band mask has more overlap with the contour's filled
-region; "A+B" if both are within 20% of each other and both nonzero.
+`candidates` returns per-contour dicts with keys: `outer_corners` (proc space, 4x2
+ordered), `inner_corners` (4x2 ordered or None), `center`, `bbox`, `aspect`,
+`solidity`, `area_frac`, `confidence`, `band`, `passed` (bool: passed validation
+AND confidence threshold), and `reject_reason` (str: "" if passed, else one of
+"area", "aspect", "solidity", "confidence"). Determine `band` by which band mask
+has more overlap with the contour's filled region; "A+B" if both are within 20% of
+each other and both nonzero.
 
 ### Production entry point
 
@@ -212,6 +239,7 @@ OpenCV application. No tkinter, no matplotlib, no threads. Single blocking loop.
 | min_solidity x100| 0..100    | min_solidity = v/100     |
 | min_aspect x100  | 10..300   | min_aspect = v/100       |
 | max_aspect x100  | 10..500   | max_aspect = v/100       |
+| approx_eps x1000 | 5..100    | approx_epsilon_frac = v/1000 |
 | gate_conf x100   | 0..100    | confidence_threshold = v/100 |
 
 Initialize each trackbar position from the current param (inverse conversion).
@@ -259,11 +287,14 @@ step][ [ ] select ][w save cfg][s snapshot]`.
 
 For the selected candidate (cycle with `[` and `]`; clamp to range; if none show a
 black image with "no candidates"): left side stacks the candidate's cropped region
-from `proc`, its crop from `mask_clean`, and its crop from `hsv_s`, each upscaled so
-width >= 240 (INTER_NEAREST), labeled. Right side is a black text panel listing:
+from `proc` (with its outer corners drawn as green dots and inner corners as cyan
+dots, numbered 0-3 in TL,TR,BR,BL order), its crop from `mask_clean`, and its crop
+from `hsv_s`, each upscaled so width >= 240 (INTER_NEAREST), labeled. Right side is
+a black text panel listing:
 ```
 candidate <i>/<n>
 band        <A|B|A+B>
+corners     outer 4 / inner <4|none>
 area_frac   <..>   (min <min_area_frac>)
 aspect      <..>   (<min_aspect>..<max_aspect>)
 solidity    <..>   (min <min_solidity>)
@@ -304,10 +335,12 @@ Create `./snapshots/` if missing. Files: `snap_YYYYMMDD_HHMMSS_mosaic.png` and
 - Add a method `process_detections(self, frame)` that returns
   `self.detector.process_frame(frame)` (keep the name so the detection thread is
   unchanged).
-- The overlay draws `gate['corners']` as a polygon (fall back to the bbox if
-  corners is None) and uses `gate['confidence']` for color. Update the drawing code
-  to read the new result keys (`confidence`, `corners`) instead of the old ones
-  (`fusion_confidence`, `hull`, `methods`).
+- The overlay draws `gate['corners']` (outer quad) as a polygon (fall back to the
+  bbox if it is None) and uses `gate['confidence']` for color. If
+  `gate['inner_corners']` is not None, draw it as a second, thinner polygon. Update
+  the drawing code to read the new result keys (`confidence`, `corners`,
+  `inner_corners`) instead of the old ones (`fusion_confidence`, `hull`,
+  `methods`).
 - Control-panel sliders (if kept) call `self.detector.update(param=value)`. Remove
   sliders for deleted parameters (Canny, corner sensitivity, method weights,
   active vision, gate-prior tolerance). Keep display toggles on the overlay object.
@@ -342,6 +375,9 @@ Create `./snapshots/` if missing. Files: `snap_YYYYMMDD_HHMMSS_mosaic.png` and
   "min_solidity": 0.70,
   "min_aspect": 0.40,
   "max_aspect": 2.50,
+
+  "approx_epsilon_frac": 0.03,
+  "find_inner_corners": true,
 
   "confidence_threshold": 0.30
 }
