@@ -1,107 +1,14 @@
-# Setup Instructions
+# Setup
 
-## Quick Start
+## Install
 
-### 1. Install Dependencies (First Time Only)
 ```bash
-cd part1
+python -m venv .venv
+.venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
 
-This installs:
-- `ultralytics` - YOLOv8 (already trained model)
-- `opencv-python` - Video processing
-- `torch` - Deep learning
-- `torchvision` - Image utilities
-- `numpy` - Array operations
-- `Pillow` - Image rendering for overlay
-- `mss` - Fast screen capture
-
-### 2. Run the Overlay Detector
-
-```bash
-cd part1
-python gate_overlay.py
-```
-
-This will:
-1. Start capturing your screen
-2. Open an overlay window (stays on top)
-3. Open a control panel window
-4. Begin detecting gates in real-time
-
-### 3. Before Running
-
-Make sure to:
-1. Open your video in a media player (VLC, Windows Media Player, etc.)
-2. Position the video window so you can see it
-3. Run gate_overlay.py
-4. The overlay will appear on top of your video window
-
-### 4. Use the Control Panel
-
-- **Play/Pause**: Stop detection temporarily
-- **Confidence Threshold**: Adjust detection sensitivity (lower = more detections, higher = fewer false positives)
-- **Show Labels**: Toggle gate names and scores
-- **Show Centers**: Toggle center dot visualization
-- **Statistics**: Watch live gate count and gates passed
-
-## Troubleshooting
-
-### "No module named 'mss'"
-```bash
-pip install mss
-```
-
-### "No module named 'ultralytics'"
-```bash
-pip install ultralytics
-```
-
-### "No module named 'cv2'"
-```bash
-pip install opencv-python
-```
-
-### YOLO Model Downloads Slowly
-First run downloads the ~3MB model. This is normal and only happens once.
-
-### Overlay Window Not Showing
-- Make sure you have at least two monitors configured (or virtual desktop)
-- Try adjusting monitor_index in the code
-- Make sure your video player window is in the foreground
-
-### Detection is Slow
-- Close other applications
-- Lower screen resolution if possible
-- Reduce confidence threshold to skip more frames
-- Use batch processor for offline analysis
-
-## File Structure
-
-```
-part1/
-├── gate_overlay.py              ← Main script (screen capture)
-├── gate_detector_batch.py       ← Offline processor
-├── requirements.txt             ← Python dependencies
-├── README.md                    ← What it does
-├── SETUP.md                     ← This file
-├── WINNING_TECHNIQUES.md        ← Pipeline stages and tuning
-├── BUILD_SPEC_TUNER.md          ← Spec for the visual tuner
-└── logs/                        ← Created automatically at runtime
-    └── gate_analysis_YYYYMMDD_HHMMSS.json
-```
-
-## What Happens When You Run It
-
-1. Screen capture starts (invisible)
-2. Overlay window appears (transparent, on top)
-3. Control panel opens
-4. YOLO model initializes (downloads if first time)
-5. Real-time detection begins
-6. Adjust settings with control panel
-
-## Check Installation
+Verify:
 
 ```bash
 python -c "from ultralytics import YOLO; print('YOLO OK')"
@@ -110,19 +17,38 @@ python -c "import torch; print('PyTorch OK')"
 python -c "import mss; print('MSS OK')"
 ```
 
-All should print OK
+The YOLO weights download automatically on first run.
 
-## Performance Tips
+## Run the overlay
 
-- **Fast detection?** Detection runs in background thread, doesn't block UI
-- **Adjust sensitivity live**: Confidence slider changes detection in real-time
-- **Want faster?** Use batch processor (offline analysis)
-- **CPU usage high?** Close other apps, reduce monitor resolution temporarily
+1. Open a gate video in any media player (VLC, Windows Media Player, etc.).
+2. Run:
 
-## Next: When Simulator Access Arrives
+```bash
+python gate_overlay.py
+```
 
-1. Run simulator
-2. Run gate_overlay.py
-3. Overlay will detect gates from simulator footage
-4. Use control panel to tune detection parameters
-5. Batch process for offline analysis and logging
+This starts screen capture, a transparent always-on-top overlay window, and a
+tkinter control panel. Detected gates are drawn over whatever the overlay is
+capturing.
+
+### Control panel
+
+- Detection on/off
+- Per-stage parameters (YOLO confidence, Canny, HSV, corner, weights, gate-prior)
+- Display toggles (labels, centers, method tags)
+- Live statistics
+
+## Troubleshooting
+
+- `No module named 'X'` — `pip install X` (e.g. `mss`, `ultralytics`,
+  `opencv-python`).
+- Overlay not visible — make sure the video player window is in the foreground;
+  the overlay draws on top of the captured screen region.
+- Slow detection — this pipeline runs YOLO on the CPU. Close other apps, lower the
+  capture resolution, or raise the YOLO confidence to process fewer boxes.
+
+## Notes
+
+Model weights (`*.pt`) and test footage (`*.mp4`) are gitignored. Supply your own
+video; the model downloads on first run.

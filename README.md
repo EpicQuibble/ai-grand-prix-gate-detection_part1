@@ -9,8 +9,6 @@ control and simulator integration come in later parts.
 - `gate_overlay.py` — real-time detection overlay. Screen-captures a video player
   window, runs the detection pipeline, and draws results in a transparent
   always-on-top window with a live tkinter control panel. Working.
-- `gate_detector_batch.py` — offline batch processor: runs detection over a video
-  file and writes results to JSON.
 - `WINNING_TECHNIQUES.md` — the detection pipeline stages and their tunable
   parameters.
 - `BUILD_SPEC_TUNER.md` — specification for a frame-by-frame visual tuning tool
