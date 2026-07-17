@@ -47,8 +47,3 @@ tuner (`tuner.py`, see `BUILD_SPEC_TUNER.md`).
   the overlay draws on top of the captured screen region.
 - Nothing detected — the color thresholds likely do not match the gate color in
   your footage. Tune the hue bands and saturation floor in the tuner.
-
-## Notes
-
-Test footage (`*.mp4`) is gitignored. Supply your own video. The pipeline is pure
-OpenCV; no model download is required.
