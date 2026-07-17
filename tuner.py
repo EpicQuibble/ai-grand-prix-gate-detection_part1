@@ -1,8 +1,8 @@
 """
 Visual tuner for the Part 1 color-first gate detector (BUILD_SPEC_TUNER.md).
 
-OpenCV only: three windows ("pipeline", "gate zoom", "controls"), integer
-trackbars, a dirty-flag blocking loop, an 8-panel mosaic and a per-candidate
+OpenCV only: four resizable windows ("pipeline", "gate zoom", and two control
+panels), integer trackbars, a dirty-flag blocking loop, an 8-panel mosaic and a per-candidate
 zoom. No tkinter, no matplotlib, no threads. Importing this module opens no
 window: all GUI/window/trackbar/event-loop code lives under main().
 
@@ -254,18 +254,37 @@ def main():
         "ready": False,
     }
 
-    cv2.namedWindow("pipeline")
-    cv2.namedWindow("gate zoom")
-    cv2.namedWindow("controls")
+    # OpenCV trackbars cannot scroll, and one window with 17 of them grows taller
+    # than the screen. Split them across two short, resizable, movable panels.
+    WIN_COLOR = "tune: color"
+    WIN_SHAPE = "tune: shape"
+    for name in ("pipeline", "gate zoom", WIN_COLOR, WIN_SHAPE):
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    placeholder = np.zeros((24, 360, 3), dtype=np.uint8)
+    cv2.imshow(WIN_COLOR, placeholder)
+    cv2.imshow(WIN_SHAPE, placeholder)
+    cv2.resizeWindow("pipeline", 1280, 528)
+    cv2.resizeWindow(WIN_COLOR, 380, 430)
+    cv2.resizeWindow(WIN_SHAPE, 380, 400)
+    cv2.moveWindow("pipeline", 0, 0)
+    cv2.moveWindow("gate zoom", 0, 600)
+    cv2.moveWindow(WIN_COLOR, 1290, 0)
+    cv2.moveWindow(WIN_SHAPE, 1290, 470)
+
+    tb_win = {}
 
     def on_frame(pos):
         state["frame_idx"] = pos
         state["frame_changed"] = True
 
+    def add_tb(name, window, init, maxv, cb):
+        cv2.createTrackbar(name, window, init, maxv, cb)
+        tb_win[name] = window
+
     def apply_controls(_=0):
         if not state["ready"]:
             return
-        g = lambda name: cv2.getTrackbarPos(name, "controls")
+        g = lambda name: cv2.getTrackbarPos(name, tb_win[name])
         mk = max(1, g("morph_kernel"))
         if mk % 2 == 0:
             mk += 1
@@ -289,23 +308,26 @@ def main():
         )
         state["dirty"] = True
 
-    cv2.createTrackbar("frame", "controls", 0, max(1, count - 1), on_frame)
-    cv2.createTrackbar("proc_width", "controls", _clamp(detector.proc_width - 320, 0, 960), 960, apply_controls)
-    cv2.createTrackbar("bilateral_sigma", "controls", _clamp(detector.bilateral_sigma, 1, 30), 30, apply_controls)
-    cv2.createTrackbar("band_a_h_lo", "controls", _clamp(detector.band_a_h_lo, 0, 180), 180, apply_controls)
-    cv2.createTrackbar("band_a_h_hi", "controls", _clamp(detector.band_a_h_hi, 0, 180), 180, apply_controls)
-    cv2.createTrackbar("band_b_h_lo", "controls", _clamp(detector.band_b_h_lo, 0, 180), 180, apply_controls)
-    cv2.createTrackbar("band_b_h_hi", "controls", _clamp(detector.band_b_h_hi, 0, 180), 180, apply_controls)
-    cv2.createTrackbar("sat_min", "controls", _clamp(detector.sat_min, 0, 255), 255, apply_controls)
-    cv2.createTrackbar("val_min", "controls", _clamp(detector.val_min, 0, 255), 255, apply_controls)
-    cv2.createTrackbar("val_max", "controls", _clamp(detector.val_max, 0, 255), 255, apply_controls)
-    cv2.createTrackbar("morph_kernel", "controls", _clamp(detector.morph_kernel, 1, 21), 21, apply_controls)
-    cv2.createTrackbar("min_area x10000", "controls", _clamp(detector.min_area_frac * 10000, 1, 500), 500, apply_controls)
-    cv2.createTrackbar("min_solidity x100", "controls", _clamp(detector.min_solidity * 100, 0, 100), 100, apply_controls)
-    cv2.createTrackbar("min_aspect x100", "controls", _clamp(detector.min_aspect * 100, 10, 300), 300, apply_controls)
-    cv2.createTrackbar("max_aspect x100", "controls", _clamp(detector.max_aspect * 100, 10, 500), 500, apply_controls)
-    cv2.createTrackbar("approx_eps x1000", "controls", _clamp(detector.approx_epsilon_frac * 1000, 5, 100), 100, apply_controls)
-    cv2.createTrackbar("gate_conf x100", "controls", _clamp(detector.confidence_threshold * 100, 0, 100), 100, apply_controls)
+    # Color / preprocessing panel
+    add_tb("proc_width", WIN_COLOR, _clamp(detector.proc_width - 320, 0, 960), 960, apply_controls)
+    add_tb("bilateral_sigma", WIN_COLOR, _clamp(detector.bilateral_sigma, 1, 30), 30, apply_controls)
+    add_tb("band_a_h_lo", WIN_COLOR, _clamp(detector.band_a_h_lo, 0, 180), 180, apply_controls)
+    add_tb("band_a_h_hi", WIN_COLOR, _clamp(detector.band_a_h_hi, 0, 180), 180, apply_controls)
+    add_tb("band_b_h_lo", WIN_COLOR, _clamp(detector.band_b_h_lo, 0, 180), 180, apply_controls)
+    add_tb("band_b_h_hi", WIN_COLOR, _clamp(detector.band_b_h_hi, 0, 180), 180, apply_controls)
+    add_tb("sat_min", WIN_COLOR, _clamp(detector.sat_min, 0, 255), 255, apply_controls)
+    add_tb("val_min", WIN_COLOR, _clamp(detector.val_min, 0, 255), 255, apply_controls)
+    add_tb("val_max", WIN_COLOR, _clamp(detector.val_max, 0, 255), 255, apply_controls)
+
+    # Frame navigation + shape/validation panel
+    add_tb("frame", WIN_SHAPE, 0, max(1, count - 1), on_frame)
+    add_tb("morph_kernel", WIN_SHAPE, _clamp(detector.morph_kernel, 1, 21), 21, apply_controls)
+    add_tb("min_area x10000", WIN_SHAPE, _clamp(detector.min_area_frac * 10000, 1, 500), 500, apply_controls)
+    add_tb("min_solidity x100", WIN_SHAPE, _clamp(detector.min_solidity * 100, 0, 100), 100, apply_controls)
+    add_tb("min_aspect x100", WIN_SHAPE, _clamp(detector.min_aspect * 100, 10, 300), 300, apply_controls)
+    add_tb("max_aspect x100", WIN_SHAPE, _clamp(detector.max_aspect * 100, 10, 500), 500, apply_controls)
+    add_tb("approx_eps x1000", WIN_SHAPE, _clamp(detector.approx_epsilon_frac * 1000, 5, 100), 100, apply_controls)
+    add_tb("gate_conf x100", WIN_SHAPE, _clamp(detector.confidence_threshold * 100, 0, 100), 100, apply_controls)
 
     state["ready"] = True
     apply_controls()
@@ -313,7 +335,7 @@ def main():
     def step(delta):
         ni = max(0, min(state["frame_idx"] + delta, count - 1))
         state["frame_idx"] = ni
-        cv2.setTrackbarPos("frame", "controls", ni)
+        cv2.setTrackbarPos("frame", tb_win["frame"], ni)
         state["frame_changed"] = True
 
     def select(delta):
