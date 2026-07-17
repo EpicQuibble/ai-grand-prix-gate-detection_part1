@@ -18,20 +18,20 @@ control and simulator integration come in later parts.
 
 ## Detection pipeline
 
-Modular classical-CV approach (chosen over end-to-end learning for
-interpretability and low compute):
+Pure classical CV, color-first — no neural network in Part 1. The gates are a
+saturated color (purple, with a green LED base) against a desaturated arena, so a
+saturation-gated color threshold isolates them almost completely.
 
-1. Preprocess — bilateral filter to reduce noise while preserving edges.
-2. YOLOv8n — initial region localization.
-3. Semantic segmentation — weighted fusion of three masks: Canny edges, HSV color,
-   Harris corners.
-4. Active-vision corner finding — sample only gate-boundary pixels.
-5. Gate-prior validation — reject detections whose aspect ratio is implausible.
+1. Resize to a fixed processing width; optional bilateral filter for motion blur.
+2. HSV color threshold on the gate hue band(s), gated by a saturation floor that
+   rejects the grey background and white ceiling lights.
+3. Morphological close/open to consolidate the gate outline.
+4. Contour extraction, then `minAreaRect` for the four gate corners.
+5. Shape/size validation (aspect ratio, solidity, minimum area) to reject
+   non-gate blobs, producing a confidence score.
 
-Note: `gate_overlay.py` uses the stock `yolov8n` COCO model, which detects general
-objects rather than gates specifically. Gate-specific training is future work; for
-highlighted, high-signal-to-noise gates the classical CV stages carry most of the
-weight.
+A trained gate detector is deliberately left to Part 2, when labeled gate data is
+available. See `BUILD_SPEC_TUNER.md` for the full specification and rationale.
 
 ## Setup
 
@@ -51,5 +51,6 @@ See `SETUP.md` for details and troubleshooting.
 
 ## Not tracked in git
 
-Model weights (`*.pt`, downloaded on first run) and test footage (`*.mp4`) are
-gitignored. Supply your own video; the YOLO model downloads automatically.
+Test footage (`*.mp4`) is gitignored — supply your own video. The pipeline is pure
+OpenCV, so no model weights are needed. (`*.pt` files are also gitignored in case
+Part 2 introduces a trained model.)

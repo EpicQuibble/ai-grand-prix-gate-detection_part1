@@ -1,490 +1,375 @@
-# Build Spec: Gate Detection Tuner + Core Refactor
+# Build Spec: Part 1 Gate Detection (color-first pipeline + visual tuner)
 
-This document is an implementation specification. Follow it exactly. Do not add
-features, files, documentation, or commentary beyond what is listed here. Do not
-use emojis anywhere. Do not create extra README/summary files.
-
-The goal: split the detection logic out of the tkinter overlay into a shared,
-UI-free core module, then build an OpenCV-based visual tuning tool that shows
-every intermediate stage of the pipeline for one frame at a time, with live
-trackbars, so parameters can be tuned by eye and saved to a config file that both
-the tuner and the live overlay load.
+This document is an implementation specification. Implement exactly what is written
+here. Make no architectural decisions of your own: every parameter, default,
+data structure, and behavior is specified below. If something appears
+underspecified, implement the simplest reading of the text and leave a `# TODO`
+comment; do not invent features. No emojis. No extra files. No narrative logging.
 
 --------------------------------------------------------------------------------
 
-## 0. Hard constraints (read first — these drive every decision)
+## Part 1 goal and success criteria
 
-Target machine: Intel i7-10510U, 4 cores, no dedicated GPU (YOLO runs on CPU),
-~1.7 GB free RAM, Windows 10. This is a weak machine. The following rules are
-NON-NEGOTIABLE and exist because of it:
+Goal: reliably detect and outline racing gates in FPV arena footage (the DCL test
+clip in this folder) and future similar/VQ1 footage, using pure classical computer
+vision. No neural network is used in Part 1.
 
-1. The tuner NEVER runs a real-time playback loop with YOLO in it. It processes
-   exactly ONE frame on demand — when the user steps to a new frame or changes a
-   parameter. Between those events the program sits in a blocking `cv2.waitKey`
-   and does no work.
+Context that drives the design (verified from the test footage): the gates are a
+saturated purple color with a green LED strip at the base, set against a
+desaturated grey arena. The only other bright objects are white ceiling lights,
+which are high-brightness but low-saturation. Therefore a saturation-gated color
+threshold isolates the gates almost completely. This matches the stated Virtual
+Qualifier 1 conditions (desaturated environment, highlighted gates, high
+signal-to-noise).
 
-2. YOLO is the single most expensive operation. It must be cached per frame. When
-   the user changes a cheap CV parameter (Canny, HSV, corner, weights, threshold),
-   the tool MUST reuse the cached YOLO boxes and only recompute the cheap CV
-   stages. YOLO re-runs ONLY when the frame index changes or the YOLO confidence /
-   processing-width parameter changes. This is the most important performance
-   decision in this spec. Get it right.
+Success criteria (Part 1 is "done" when all hold on the test clip, using one saved
+`gate_config.json`):
 
-3. All processing happens at a reduced resolution controlled by `proc_width`
-   (default 640). The frame is downscaled to this width (preserving aspect ratio)
-   BEFORE any detection. Everything downstream works in this reduced space.
+1. Every clearly visible gate (occupying at least ~4% of frame height, not at the
+   extreme frame edge, not in the worst motion blur) is outlined with a 4-corner
+   polygon in at least 90% of the frames in which it is visible.
+2. No more than 1 false-positive gate per 20 frames on average across the clip.
+3. The pipeline runs at 15 FPS or better at `proc_width = 640` on the target
+   laptop (CPU only; achievable because there is no neural network).
+4. The parameters that achieve this are saved in `gate_config.json` and both the
+   tuner and the overlay reproduce the result from that file.
 
-4. The mosaic display window has a fixed maximum total width (1280 px). Panels are
-   sized to fit inside it. Never blit full 1080p arrays to the screen.
-
-5. Record and display per-stage timings (milliseconds) so the user can see what is
-   slow on their hardware and disable it.
+Explicitly out of scope for Part 1 (do not implement): any neural network, YOLO,
+trained gate model, tracking across frames, or control/flight logic. A trained
+gate detector is Part 2.
 
 --------------------------------------------------------------------------------
 
-## 1. Files to produce
+## Files to produce
 
-1. `gate_detection_core.py`  — new. Pure detection logic. No tkinter, no OpenCV
-   windows, no screen capture, no threads. Imports allowed: `cv2`, `numpy`,
-   `json`, `time`, `ultralytics.YOLO`.
-
-2. `tuner.py` — new. The OpenCV visual tuning tool. Imports `gate_detection_core`.
-
-3. `gate_overlay.py` — modify. Delete the detection methods that now live in the
-   core; import and use the core instead. Load parameters from `gate_config.json`
-   on startup. Everything else about the overlay stays as-is.
-
+1. `gate_detection_core.py` — new. Pure detection logic. No UI, no windows, no
+   screen capture, no threads. Imports allowed: `cv2`, `numpy`, `json`, `time`.
+   (No `ultralytics`, no `torch`.)
+2. `tuner.py` — new. OpenCV visual tuning tool. Imports `gate_detection_core`.
+3. `gate_overlay.py` — modify. Replace its detection internals with calls to the
+   core; load `gate_config.json` on startup. Keep its capture/overlay/threading.
 4. `gate_config.json` — new. Written by the tuner, read by both tools. Schema in
-   section 5. If the file is missing, the core uses the hardcoded defaults in
-   section 5 and does not crash.
+   the config section. If missing, the core uses the built-in defaults and does
+   not crash.
 
 --------------------------------------------------------------------------------
 
-## 2. gate_detection_core.py
+## The pipeline (this is the whole algorithm)
 
-### 2.1 Class
+For one BGR frame:
+
+1. Resize to `proc_width` (keep aspect ratio); remember the scale factor.
+2. If `preprocess_enabled`: bilateral filter
+   `cv2.bilateralFilter(img, 9, bilateral_sigma, bilateral_sigma)`.
+3. Convert to HSV (`cv2.COLOR_BGR2HSV`, OpenCV H is 0-180).
+4. Build the color mask by OR-ing the enabled hue bands. For each enabled band X
+   (A and B), `cv2.inRange(hsv, (band_X_h_lo, sat_min, val_min),
+   (band_X_h_hi, 255, val_max))`. OR the band masks together with
+   `cv2.bitwise_or`. If no band is enabled, the mask is all zeros.
+5. Clean the mask: `MORPH_CLOSE` then `MORPH_OPEN` with an elliptical kernel of
+   size `(morph_kernel, morph_kernel)`.
+6. `cv2.findContours(mask, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)`.
+7. For each contour, compute candidate metrics:
+   - `area = cv2.contourArea(contour)`; `area_frac = area / (proc_w * proc_h)`.
+   - Reject immediately if `area_frac < min_area_frac`.
+   - `rect = cv2.minAreaRect(contour)` -> `(cx, cy), (w, h), angle`.
+   - `aspect = max(w, h) / max(min(w, h), 1e-6)`.
+   - `hull = cv2.convexHull(contour)`; `solidity = area / max(cv2.contourArea(hull), 1e-6)`.
+   - `corners = cv2.boxPoints(rect)` (4 points).
+8. Validate the candidate (all must hold, else reject):
+   - `min_aspect <= aspect <= max_aspect`.
+   - `solidity >= min_solidity`.
+9. Confidence (0..1):
+   - `size_score = min(1.0, area_frac / 0.02)` (a gate at >=2% of the frame scores
+     full on size).
+   - `confidence = 0.5 * solidity + 0.5 * size_score`.
+   - Keep the gate only if `confidence >= confidence_threshold`.
+10. Build the gate result. Scale `corners`, center `(cx, cy)`, and the bounding box
+    back to the ORIGINAL frame size using the scale factor from step 1.
+
+Sort gates by `area_frac` descending (closest first). Return them.
+
+Gate result dict keys (the overlay expects these; keep names exact):
+```
+x1, y1, x2, y2          # axis-aligned bbox of the corners, original-frame pixels
+width, height           # bbox size
+center_x, center_y      # gate center, original-frame pixels
+corners                 # np.ndarray shape (4,2), original-frame pixels
+confidence              # float 0..1
+band                    # "A" or "B" or "A+B": which band(s) contributed most
+aspect, solidity, area_frac   # metrics, for display/debug
+```
+
+--------------------------------------------------------------------------------
+
+## gate_detection_core.py
+
+### Class
 
 ```
 class GateDetector:
-    def __init__(self, config: dict | None = None, model_path: str = "yolov8n.pt")
+    def __init__(self, config: dict | None = None)
 ```
+Set every parameter in the config schema from `config` if given, else the default.
+No I/O or windows in `__init__`.
 
-- Loads the YOLO model once in `__init__`.
-- Initializes every parameter in section 5 from `config` if provided, else the
-  default. Store each as a plain attribute (e.g. `self.canny_low`).
-- Do NOT open any window, thread, or capture device.
-
-### 2.2 Config helpers
+### Config helpers
 
 ```
-def to_dict(self) -> dict          # return all params in section 5 as a flat dict
-def update(self, **params) -> None # set any subset of params by name
-def load_config(self, path) -> None
+def to_dict(self) -> dict
+def update(self, **params) -> None
+def load_config(self, path) -> None          # missing file: keep defaults, no error
 def save_config(self, path) -> None
 @classmethod
-def from_config_file(cls, path, model_path="yolov8n.pt") -> "GateDetector"
+def from_config_file(cls, path) -> "GateDetector"
 ```
+Unknown keys in a loaded file are ignored; missing keys keep defaults.
 
-`load_config` / `from_config_file`: if the file does not exist, keep defaults and
-return normally (no exception). Ignore unknown keys in the file. Missing keys keep
-their default.
-
-### 2.3 Cheap CV primitives (no YOLO, operate on any BGR image)
-
-These are ported directly from the current `gate_overlay.py`. Keep the same math.
-Each takes a BGR image and returns as described. They must work on a full frame OR
-a cropped gate region — the caller decides what to pass.
+### Primitives (each takes the already-resized BGR frame)
 
 ```
-def preprocess(self, frame_bgr) -> frame_bgr
-    # bilateral filter if self.preprocess_enabled else return input unchanged
-    # cv2.bilateralFilter(frame, 9, self.bilateral_sigma, self.bilateral_sigma)
-
-def edges(self, frame_bgr) -> uint8 single-channel
-    # gray -> bilateralFilter(gray,5,10,10) -> Canny(canny_low,canny_high)
-    # -> dilate 3x3 ellipse 1 iter
-
-def color_mask(self, frame_bgr) -> uint8 single-channel
-    # HSV inRange([h_min,s_min,v_min],[180,255,255]) -> MORPH_CLOSE then MORPH_OPEN, 5x5 ellipse
-
-def corner_response(self, frame_bgr) -> float32 array
-    # gray -> cornerHarris(2,3,0.04)
-
-def combined_mask(self, frame_bgr) -> (uint8 binary mask, methods:list[str], confidences:dict)
-    # Replicate current find_gate_polygon Stage-1 fusion exactly:
-    #   combined = zeros float32
-    #   if edge_enabled:   combined += edges*edge_weight;    methods+='edge';  conf['edge']=mean(edges)/255
-    #   if color_enabled:  combined += color*color_weight;   methods+='color'; conf['color']=mean(color)/255
-    #   if corner_enabled: cm=(corner> corner_threshold*corner.max()); combined += cm*corner_weight;
-    #                      methods+='corner'; conf['corner']=mean(cm)
-    #   normalize combined to 0..255 uint8
-    #   threshold at self.mask_threshold  (NEW param, replaces hardcoded 50)
-    #   MORPH_CLOSE 3x3 ellipse
-    # Return the binary mask, methods, confidences. If no methods enabled, mask is all-zero.
+def preprocess(self, bgr) -> bgr
+def color_mask(self, bgr) -> (mask uint8, band_a_mask uint8, band_b_mask uint8)
+def candidates(self, mask) -> list[dict]     # steps 6-9, in proc space
 ```
+`candidates` returns per-contour dicts with keys: `corners` (proc space),
+`center`, `bbox`, `aspect`, `solidity`, `area_frac`, `confidence`, `band`,
+`passed` (bool: passed validation AND confidence threshold), and `reject_reason`
+(str: "" if passed, else one of "area", "aspect", "solidity", "confidence").
+Determine `band` by which band mask has more overlap with the contour's filled
+region; "A+B" if both are within 20% of each other and both nonzero.
 
-Note: `mask_threshold` is a new parameter (default 50) replacing the hardcoded
-value in the current code.
-
-### 2.4 Per-gate geometry (ported unchanged)
+### Production entry point
 
 ```
-def find_corners_active_vision(self, gate_mask, box) -> np.ndarray|None   # unchanged logic
-def validate_gate_prior(self, corners, box) -> (bool, corners)            # unchanged logic
+def process_frame(self, bgr) -> list[dict]
 ```
+Runs the full pipeline, returns only gates with `passed == True`, coordinates
+scaled to the ORIGINAL frame, sorted by `area_frac` desc, using the exact result
+keys above.
 
-`box` is a tuple `(x1, y1, x2, y2)` in the reduced/proc space.
-
-### 2.5 YOLO (the expensive call, isolated so it can be cached)
-
-```
-def yolo_boxes(self, frame_bgr) -> list[tuple[int,int,int,int,float]]
-    # results = self.model(frame_bgr, conf=self.yolo_confidence, verbose=False)
-    # for each box: (x1,y1,x2,y2,conf) clipped to frame bounds
-    # apply class filter: if self.yolo_classes is not None, keep only those class ids
-    #   (self.yolo_classes default = None meaning keep all)
-    # return list
-```
-
-### 2.6 Full production pipeline
+### Debug entry point (used by the tuner)
 
 ```
-def process_frame(self, frame_bgr) -> list[dict]
-    # 1. resize frame to proc_width (helper self._resize_to_proc, keep scale factor)
-    # 2. pre = self.preprocess(resized)
-    # 3. boxes = self.yolo_boxes(pre)
-    # 4. for each box: region = pre[y1:y2, x1:x2]; run _gate_from_region(region, box)
-    # 5. keep gates whose fused_confidence >= self.confidence_threshold and
-    #    (gate_prior passes if enabled)
-    # 6. scale all coordinates back to the ORIGINAL frame size before returning
-    #    (so the overlay draws in original pixels)
-    # Return list of gate dicts with the same keys the current overlay expects:
-    #   x1,y1,x2,y2,width,height,center_x,center_y,yolo_confidence,
-    #   fusion_confidence,hull,methods
+def process_frame_debug(self, bgr) -> dict
 ```
-
-Provide a private helper `_gate_from_region(region_bgr, box)` that runs
-combined_mask -> active vision (or contour fallback) -> gate_prior and returns the
-fused result (corners, methods, confidences, fused_confidence) or None. This is
-the shared core of both `process_frame` and `process_frame_debug`.
-
-### 2.7 Debug pipeline (used by the tuner)
-
-This is the function the tuner calls. It returns EVERY intermediate as arrays so
-the tuner just renders them — the tuner does no detection math itself.
-
+Returns everything the tuner renders (all images in proc space unless noted):
 ```
-def process_frame_debug(self, frame_bgr, cached_boxes=None) -> DebugResult
+{
+  "proc":        BGR resized frame actually processed,
+  "preprocessed":BGR,
+  "hsv_h":       uint8 1ch (the H channel),
+  "hsv_s":       uint8 1ch (the S channel),
+  "hsv_v":       uint8 1ch (the V channel),
+  "mask_a":      uint8 1ch,
+  "mask_b":      uint8 1ch,
+  "mask_raw":    uint8 1ch (bands OR'd, before morphology),
+  "mask_clean":  uint8 1ch (after morphology),
+  "candidates":  list of candidate dicts from candidates() (proc space),
+  "scale":       float (proc -> original),
+  "timings":     {"color_ms":float,"contours_ms":float,"total_ms":float}
+}
 ```
-
-Behavior:
-- Resize to proc_width. Record scale.
-- `pre = preprocess(resized)`.
-- If `cached_boxes is None`: run `yolo_boxes(pre)` and time it. Else reuse
-  `cached_boxes` and record yolo time as 0.
-- Compute WHOLE-FRAME stage images on `pre`: edges, color_mask, corner heatmap
-  (colorize the float response with `cv2.applyColorMap` after normalizing to
-  uint8, use `COLORMAP_JET`), combined_mask (return both the normalized pre-
-  threshold grayscale AND the final binary).
-- For each box: crop region from `pre`, compute per-gate edges/color/corner/
-  combined/mask, run active vision + gate_prior, fill a GateDebug entry with all
-  stats (see structure below).
-- Time each stage group and put milliseconds in `timings`.
-
-`DebugResult` and `GateDebug` may be plain dicts or dataclasses. Use this exact
-key set:
-
-```
-DebugResult:
-  proc_frame        # BGR, the resized frame actually processed
-  preprocessed      # BGR
-  edges_full        # uint8 1ch
-  color_full        # uint8 1ch
-  corner_heat_full  # BGR (colormapped)
-  combined_full     # uint8 1ch (normalized, pre-threshold)
-  mask_full         # uint8 1ch (final binary, whole frame)
-  boxes             # list[(x1,y1,x2,y2,conf)]  in proc space
-  gates             # list[GateDebug]
-  timings           # dict: {"yolo_ms":float,"cv_ms":float,"pergate_ms":float,"total_ms":float}
-  scale             # float, proc->original scale factor
-
-GateDebug:
-  box               # (x1,y1,x2,y2) proc space
-  yolo_conf         # float
-  region            # BGR crop
-  edges             # uint8 1ch
-  color             # uint8 1ch
-  corner_heat       # BGR
-  combined          # uint8 1ch
-  mask              # uint8 1ch
-  corners           # np.ndarray|None (proc space)
-  methods           # list[str]
-  method_conf       # dict
-  fused_conf        # float
-  expected_aspect   # float
-  detected_aspect   # float|None
-  aspect_error      # float|None
-  prior_passed      # bool
-  accepted          # bool  (fused_conf>=threshold AND prior ok if enabled)
-```
+No YOLO caching logic is needed because there is no neural network; the whole
+pipeline is cheap, so the tuner recomputes it on every change.
 
 --------------------------------------------------------------------------------
 
-## 3. tuner.py
+## tuner.py
 
-An OpenCV application. No tkinter. Single-threaded. Blocking event loop.
+OpenCV application. No tkinter, no matplotlib, no threads. Single blocking loop.
 
-### 3.1 Startup / CLI
+### Startup
 
-- `python tuner.py [video_path]`
-- If no path given, search the current directory for the first `*.mp4` and use it.
-  If none found, print a one-line error and exit.
-- Load `gate_config.json` if present, else defaults. Build one `GateDetector`.
-- Open the video with `cv2.VideoCapture`. Read total frame count
-  (`CAP_PROP_FRAME_COUNT`). Start at frame 0.
+- `python tuner.py [video_path]`. If no path, use the first `*.mp4` in the current
+  directory; if none, print one error line and exit.
+- Load `gate_config.json` if present else defaults; build one `GateDetector`.
+- Open the video with `cv2.VideoCapture`; read `CAP_PROP_FRAME_COUNT`. Start at
+  frame 0.
 
-### 3.2 Windows (three named windows)
+### Windows
 
-1. `"pipeline"` — the mosaic (section 3.5).
-2. `"gate zoom"` — the per-gate breakdown (section 3.6).
-3. `"controls"` — trackbars only (section 3.3).
+1. `"pipeline"` — the mosaic.
+2. `"gate zoom"` — the selected-candidate breakdown.
+3. `"controls"` — trackbars.
 
-### 3.3 Trackbars (all on the "controls" window)
+### Trackbars (on "controls"; integer-only, convert as shown)
 
-Trackbars are integer-only. Use the exact ranges and conversions below. On each
-trackbar callback, write the converted value onto the detector and set the dirty
-flag (section 3.4). Do NOT re-run YOLO from a CV-trackbar callback.
+| label            | int range | -> param                 |
+|------------------|-----------|--------------------------|
+| frame            | 0..count-1| seek (see below)         |
+| proc_width       | 0..960    | proc_width = v + 320     |
+| bilateral_sigma  | 1..30     | bilateral_sigma = v      |
+| band_a_h_lo      | 0..180    | band_a_h_lo = v          |
+| band_a_h_hi      | 0..180    | band_a_h_hi = v          |
+| band_b_h_lo      | 0..180    | band_b_h_lo = v          |
+| band_b_h_hi      | 0..180    | band_b_h_hi = v          |
+| sat_min          | 0..255    | sat_min = v              |
+| val_min          | 0..255    | val_min = v              |
+| val_max          | 0..255    | val_max = v              |
+| morph_kernel     | 1..21     | morph_kernel = v (force odd; if even use v+1) |
+| min_area x10000  | 1..500    | min_area_frac = v/10000  |
+| min_solidity x100| 0..100    | min_solidity = v/100     |
+| min_aspect x100  | 10..300   | min_aspect = v/100       |
+| max_aspect x100  | 10..500   | max_aspect = v/100       |
+| gate_conf x100   | 0..100    | confidence_threshold = v/100 |
 
-| Trackbar label      | int range | conversion to param            | param              | reruns YOLO? |
-|---------------------|-----------|--------------------------------|--------------------|--------------|
-| yolo_conf x100      | 1..90     | v/100                          | yolo_confidence    | YES          |
-| proc_width          | 0..960    | v+320                          | proc_width         | YES          |
-| bilateral_sigma     | 1..30     | v                              | bilateral_sigma    | YES (affects preprocess before YOLO) |
-| canny_low           | 0..255    | v                              | canny_low          | no           |
-| canny_high          | 0..255    | v                              | canny_high         | no           |
-| hue_min             | 0..180    | v                              | color_h_min        | no           |
-| sat_min             | 0..255    | v                              | color_s_min        | no           |
-| val_min             | 0..255    | v                              | color_v_min        | no           |
-| corner_sens x1000   | 1..50     | v/1000                         | corner_threshold   | no           |
-| edge_w x10          | 0..20     | v/10                           | edge_weight        | no           |
-| color_w x10         | 0..20     | v/10                           | color_weight       | no           |
-| corner_w x10        | 0..20     | v/10                           | corner_weight      | no           |
-| mask_thresh         | 0..255    | v                              | mask_threshold     | no           |
-| min_methods         | 1..3      | v                              | min_methods        | no           |
-| prior_tol x100      | 5..50     | v/100                          | gate_prior_tolerance | no         |
-| search_radius       | 3..60     | v                              | corner_search_radius | no         |
-| gate_conf x100      | 1..90     | v/100                          | confidence_threshold | no         |
+Initialize each trackbar position from the current param (inverse conversion).
+Every trackbar callback writes the param onto the detector and sets a `dirty` flag.
+The `frame` trackbar sets `frame_idx` and flags a frame change.
 
-Because `proc_width` uses `v+320`, its callback must set proc_width = trackbar+320.
-Initialize every trackbar position from the current param value (inverse of the
-conversion).
+### Main loop
 
-### 3.4 Dirty-flag state machine (the caching rule)
+- If a frame change is pending: `cap.set(CAP_PROP_POS_FRAMES, frame_idx)`, read the
+  frame, store it.
+- If `dirty` or frame changed: `result = detector.process_frame_debug(frame)`;
+  rebuild and `imshow` the mosaic and zoom; clear flags.
+- `cv2.waitKey(30)`; handle keys. When nothing is dirty, the loop only waits.
 
-Maintain:
+### Mosaic ("pipeline")
+
+Fixed 2 rows x 4 columns, total width capped at 1280 (cell width = 320; cell height
+keeps the proc frame aspect). Convert 1-channel panels to BGR before tiling. Resize
+each panel to the cell size, draw a text label (FONT_HERSHEY_SIMPLEX 0.4, white
+with a 1px black outline drawn first) top-left. Separate cells with a 2px black
+border. Panels in order:
+
+1. proc                          "1 original"
+2. preprocessed                  "2 preprocess s=<bilateral_sigma>"
+3. hsv_s                          "3 saturation"   (this is the key channel)
+4. mask_a                         "4 band A H<a_lo>-<a_hi>"
+5. mask_b                         "5 band B H<b_lo>-<b_hi>"
+6. mask_clean                     "6 mask (morph k=<morph_kernel>)"
+7. contours view                  "7 candidates"
+8. annotated proc                 "8 result"
+
+Panel 7 "candidates": proc frame copy with every candidate's `minAreaRect` polygon
+drawn — green if `passed`, red if rejected — plus its `reject_reason` in small text
+at the candidate center.
+
+Panel 8 "result": proc frame copy with only passed gates drawn as polygons colored
+by confidence (green >0.8, yellow >0.5, else red), the selected candidate's polygon
+thickened in cyan, and its center dot.
+
+Bottom status bar (full width, ~24px, black): `frame <idx>/<count>  passed
+<n_passed>/<n_candidates>  color <color_ms>ms total <total_ms>ms  [SPACE play][a/d
+step][ [ ] select ][w save cfg][s snapshot]`.
+
+### Zoom ("gate zoom")
+
+For the selected candidate (cycle with `[` and `]`; clamp to range; if none show a
+black image with "no candidates"): left side stacks the candidate's cropped region
+from `proc`, its crop from `mask_clean`, and its crop from `hsv_s`, each upscaled so
+width >= 240 (INTER_NEAREST), labeled. Right side is a black text panel listing:
 ```
-frame_idx           # current frame number
-frame_bgr           # the raw frame read from video at frame_idx
-cached_boxes        # list or None
-selected_gate       # int index into result.gates
-need_yolo           # bool
-need_recompute      # bool
-last_result         # DebugResult
-```
-
-Rules:
-- Changing frame (step/seek): read new `frame_bgr`, set `cached_boxes=None`,
-  `need_yolo=True`, `need_recompute=True`.
-- A YES-reruns-YOLO trackbar: `cached_boxes=None`, `need_yolo=True`,
-  `need_recompute=True`.
-- A no-rerun trackbar: `need_recompute=True` only (keep `cached_boxes`).
-- Toggling a method on/off (keys, section 3.7): `need_recompute=True` only.
-
-Recompute step (run once per loop iteration when `need_recompute`):
-```
-result = detector.process_frame_debug(frame_bgr,
-                                      cached_boxes=None if need_yolo else cached_boxes)
-if need_yolo: cached_boxes = result.boxes
-clamp selected_gate into range
-last_result = result
-need_yolo = False
-need_recompute = False
-rebuild both mosaic and zoom images and imshow them
-```
-
-If `need_recompute` is false, the loop only calls `cv2.waitKey` and handles keys.
-This keeps the CPU idle when nothing is changing.
-
-### 3.5 Mosaic builder ("pipeline" window)
-
-Build a 2-row by 4-column grid of 8 panels from `last_result`. Panels, in order:
-
-1. proc_frame                 label "1 original"
-2. preprocessed               label "2 preprocess sigma=<bilateral_sigma>"
-3. edges_full (to BGR)        label "3 canny <low>/<high>"
-4. color_full (to BGR)        label "4 color H>=<h> S>=<s> V>=<v>"
-5. corner_heat_full           label "5 harris <corner_threshold>"
-6. combined_full (to BGR)     label "6 combined"
-7. mask_full (to BGR)         label "7 mask thr=<mask_threshold>"
-8. annotated proc_frame       label "8 result"
-
-Panel 8 = copy of proc_frame with, drawn on top:
-- every YOLO box as a thin gray rectangle,
-- each accepted gate polygon (green if fused_conf>0.8, yellow if >0.5, else red),
-- the selected gate's box highlighted in a distinct color (cyan) and thicker,
-- corner points of the selected gate as small filled circles.
-
-Sizing: each cell width = floor(1280/4) = 320. Cell height keeps the proc frame's
-aspect ratio. Convert every single-channel panel to BGR with
-`cv2.cvtColor(x, COLOR_GRAY2BGR)` before tiling. Resize every panel to the cell
-size. Burn the label with `cv2.putText` (FONT_HERSHEY_SIMPLEX, 0.4, white, with a
-1px black outline drawn first for legibility) at the top-left of each cell.
-Concatenate with `np.hstack` per row then `np.vstack` the two rows. Add a thin
-(2px) black separator between cells by padding panels before stacking.
-
-Bottom status bar (one extra row, full width, ~24px tall, black background):
-`frame <idx>/<total>  gates <accepted>/<total boxes>  yolo <yolo_ms>ms cv <cv_ms>ms
-total <total_ms>ms  [SPACE play] [a/d step] [w save cfg] [s snapshot]`.
-
-### 3.6 Zoom builder ("gate zoom" window)
-
-For `last_result.gates[selected_gate]` (if any gates exist; else show a black
-image with text "no gates"):
-
-Left side: 5 stacked panels, each upscaled so the gate region is at least 240 px
-wide (use `INTER_NEAREST` so pixels are crisp): region, edges, color, corner_heat,
-mask. Label each.
-
-Right side: a text panel (black background, white text) listing:
-```
-gate <selected>/<count>
-yolo_conf   <..>
-methods     <edge,color,corner>
-edge_conf   <..>
-color_conf  <..>
-corner_conf <..>
-fused_conf  <..>   (color the number green/yellow/red by the same thresholds)
-exp_aspect  <..>
-det_aspect  <..>
-aspect_err  <..>   tol=<gate_prior_tolerance>
-prior       PASS/FAIL
-accepted    YES/NO
+candidate <i>/<n>
+band        <A|B|A+B>
+area_frac   <..>   (min <min_area_frac>)
+aspect      <..>   (<min_aspect>..<max_aspect>)
+solidity    <..>   (min <min_solidity>)
+confidence  <..>   (thr <confidence_threshold>)   colored green/yellow/red
+result      PASS / REJECT (<reject_reason>)
 ```
 
-### 3.7 Keyboard controls (handle in the main loop via cv2.waitKey)
+### Keys
 
 ```
-SPACE  toggle play/pause. Play mode = auto-advance one frame per loop with a
-       ~30 ms wait. (Still one-frame-at-a-time processing; this is a slow
-       preview, acceptable because it just steps frames. If YOLO makes it crawl,
-       that is expected on this hardware — that is why step controls exist.)
-d / RIGHT   step +1 frame
-a / LEFT    step -1 frame
-D           step +30 frames
-A           step -30 frames
-[ / ]       select previous / next gate
-e           toggle edge_enabled
-c           toggle color_enabled
-r           toggle corner_enabled  (r = coRner; c is taken by color)
-v           toggle active_vision_enabled
-g           toggle gate_prior_enabled
+SPACE   play/pause (play = advance one frame per loop iteration)
+d / RIGHT   +1 frame        a / LEFT   -1 frame
+D           +30 frames      A          -30 frames
+[ / ]       select prev/next candidate
 p           toggle preprocess_enabled
-w           save current params to gate_config.json (print confirmation)
-s           snapshot: save the mosaic PNG and current params JSON into
-            ./snapshots/ with a UTC timestamp filename
+1           toggle band_a_enabled
+2           toggle band_b_enabled
+w           save params to gate_config.json (print confirmation)
+s           snapshot mosaic PNG + params JSON to ./snapshots/ (UTC timestamp)
 q / ESC     quit
 ```
+Keep the `frame` trackbar in sync when stepping (`cv2.setTrackbarPos`).
 
-Also add a "seek" trackbar labeled `frame` on the "controls" window, range
-0..(total-1). Moving it sets frame_idx and triggers a frame change. Keep it in
-sync when stepping via keys (`cv2.setTrackbarPos`).
+### Snapshots
 
-### 3.8 Snapshot output
-
-`./snapshots/` created if missing. Filenames:
-`snap_YYYYMMDD_HHMMSS_mosaic.png` and `snap_YYYYMMDD_HHMMSS_params.json`.
-The JSON is `detector.to_dict()` plus a `"frame"` key with the frame index.
+Create `./snapshots/` if missing. Files: `snap_YYYYMMDD_HHMMSS_mosaic.png` and
+`snap_YYYYMMDD_HHMMSS_params.json` (`detector.to_dict()` plus `"frame": idx`).
 
 --------------------------------------------------------------------------------
 
-## 4. gate_overlay.py changes
+## gate_overlay.py changes
 
-- Remove the detection methods now in the core: `preprocess_frame`,
-  `detect_edges`, `detect_color`, `detect_corners`, `find_corners_active_vision`,
-  `validate_gate_prior`, `find_gate_polygon`, `process_detections`.
-- In `__init__`, build `self.detector = GateDetector.from_config_file("gate_config.json")`.
-- Replace the body of `process_detections(frame)` with
-  `return self.detector.process_frame(frame)`. Keep the method name so the
-  detection thread is unchanged.
-- The control-panel tkinter sliders may stay, but each slider callback now writes
-  to `self.detector` (e.g. `self.detector.update(canny_low=int(v))`) instead of
-  to `self`. Keep the overlay's own display-only flags (show_labels, etc.) on the
-  overlay object.
-- Do not change the overlay/capture/threading code otherwise.
+- Delete the old detection methods (`preprocess_frame`, `detect_edges`,
+  `detect_color`, `detect_corners`, `find_corners_active_vision`,
+  `validate_gate_prior`, `find_gate_polygon`, `process_detections`) and the YOLO
+  model load.
+- In `__init__`: `self.detector = GateDetector.from_config_file("gate_config.json")`.
+- Add a method `process_detections(self, frame)` that returns
+  `self.detector.process_frame(frame)` (keep the name so the detection thread is
+  unchanged).
+- The overlay draws `gate['corners']` as a polygon (fall back to the bbox if
+  corners is None) and uses `gate['confidence']` for color. Update the drawing code
+  to read the new result keys (`confidence`, `corners`) instead of the old ones
+  (`fusion_confidence`, `hull`, `methods`).
+- Control-panel sliders (if kept) call `self.detector.update(param=value)`. Remove
+  sliders for deleted parameters (Canny, corner sensitivity, method weights,
+  active vision, gate-prior tolerance). Keep display toggles on the overlay object.
+- Do not change the capture/overlay/threading code otherwise.
 
 --------------------------------------------------------------------------------
 
-## 5. gate_config.json schema and defaults
-
-The core defines these defaults. The file, when present, overrides any subset.
+## gate_config.json schema and defaults
 
 ```
 {
   "proc_width": 640,
-  "yolo_confidence": 0.35,
-  "yolo_classes": null,
 
   "preprocess_enabled": true,
   "bilateral_sigma": 10,
 
-  "edge_enabled": true,
-  "canny_low": 40,
-  "canny_high": 120,
-  "edge_weight": 1.0,
+  "band_a_enabled": true,
+  "band_a_h_lo": 120,
+  "band_a_h_hi": 160,
 
-  "color_enabled": true,
-  "color_h_min": 0,
-  "color_s_min": 80,
-  "color_v_min": 120,
-  "color_weight": 1.2,
+  "band_b_enabled": false,
+  "band_b_h_lo": 40,
+  "band_b_h_hi": 85,
 
-  "corner_enabled": true,
-  "corner_threshold": 0.008,
-  "corner_weight": 0.8,
+  "sat_min": 60,
+  "val_min": 50,
+  "val_max": 255,
 
-  "mask_threshold": 50,
-  "min_methods": 1,
-  "confidence_threshold": 0.25,
+  "morph_kernel": 5,
 
-  "active_vision_enabled": true,
-  "corner_search_radius": 15,
+  "min_area_frac": 0.0008,
+  "min_solidity": 0.70,
+  "min_aspect": 0.40,
+  "max_aspect": 2.50,
 
-  "gate_prior_enabled": true,
-  "gate_prior_tolerance": 0.35
+  "confidence_threshold": 0.30
 }
 ```
 
+The purple band (A) defaults are a starting point tuned to the test footage; the
+green LED band (B) is off by default. Tuning these against the real footage in the
+tuner is the point of Part 1.
+
 --------------------------------------------------------------------------------
 
-## 6. Acceptance checklist
+## Acceptance checklist
 
-- `python -c "import gate_detection_core"` imports with no error.
-- `python tuner.py "<the test mp4>"` opens three windows, shows a frame's full
-  8-panel pipeline, and the zoom window.
-- Moving a CV trackbar (e.g. canny_low) updates the mosaic WITHOUT a visible YOLO
-  recompute (yolo_ms shows 0 in the status bar after the first frame load).
-- Moving yolo_conf or proc_width DOES re-run YOLO (yolo_ms > 0).
-- Stepping frames with a/d works; the seek trackbar stays in sync.
-- `[`/`]` cycles the selected gate and the zoom window follows.
-- `w` writes gate_config.json; re-running the tuner picks those values up.
-- `s` writes a mosaic PNG and params JSON into ./snapshots/.
-- `python gate_overlay.py` still runs and now reads gate_config.json.
+- `python -c "import gate_detection_core"` imports with no error and no torch/YOLO
+  dependency.
+- `python tuner.py "<the test mp4>"` opens three windows and shows the 8-panel
+  pipeline and zoom.
+- The saturation panel (3) clearly shows the gates bright and the background dark.
+- Moving `sat_min` / band hue trackbars visibly changes the masks in real time.
+- `[` / `]` cycles candidates; the zoom follows and shows PASS/REJECT with reason.
+- Stepping frames with a/d works and the `frame` trackbar stays in sync.
+- `w` writes `gate_config.json`; re-launching the tuner restores those values.
+- `s` writes a mosaic PNG and params JSON to ./snapshots/.
+- `python gate_overlay.py` runs, loads `gate_config.json`, and draws gate polygons.
 
-## 7. Do NOT
+## Do NOT
 
-- Do not add threads to the tuner.
-- Do not run YOLO on every trackbar move.
-- Do not use matplotlib or tkinter in the tuner.
+- Do not add YOLO, torch, any neural network, tracking, or control logic.
+- Do not add threads to the tuner, or matplotlib/tkinter to it.
 - Do not add emojis, extra markdown files, or narrative logging.
-- Do not change the detection MATH when porting; copy it verbatim, only relocating
-  it and adding the two new parameters (`proc_width`, `mask_threshold`).
+- Do not add parameters or pipeline stages beyond those specified here.

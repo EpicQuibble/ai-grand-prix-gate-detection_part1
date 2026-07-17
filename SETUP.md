@@ -11,13 +11,10 @@ pip install -r requirements.txt
 Verify:
 
 ```bash
-python -c "from ultralytics import YOLO; print('YOLO OK')"
 python -c "import cv2; print('OpenCV OK')"
-python -c "import torch; print('PyTorch OK')"
+python -c "import numpy; print('NumPy OK')"
 python -c "import mss; print('MSS OK')"
 ```
-
-The YOLO weights download automatically on first run.
 
 ## Run the overlay
 
@@ -35,20 +32,23 @@ capturing.
 ### Control panel
 
 - Detection on/off
-- Per-stage parameters (YOLO confidence, Canny, HSV, corner, weights, gate-prior)
-- Display toggles (labels, centers, method tags)
+- Color thresholds (hue bands, saturation floor, value range)
+- Shape validation (min area, aspect, solidity)
+- Display toggles (labels, centers)
 - Live statistics
+
+For tuning the color thresholds against footage frame by frame, use the visual
+tuner (`tuner.py`, see `BUILD_SPEC_TUNER.md`).
 
 ## Troubleshooting
 
-- `No module named 'X'` — `pip install X` (e.g. `mss`, `ultralytics`,
-  `opencv-python`).
+- `No module named 'X'` — `pip install X` (e.g. `mss`, `opencv-python`).
 - Overlay not visible — make sure the video player window is in the foreground;
   the overlay draws on top of the captured screen region.
-- Slow detection — this pipeline runs YOLO on the CPU. Close other apps, lower the
-  capture resolution, or raise the YOLO confidence to process fewer boxes.
+- Nothing detected — the color thresholds likely do not match the gate color in
+  your footage. Tune the hue bands and saturation floor in the tuner.
 
 ## Notes
 
-Model weights (`*.pt`) and test footage (`*.mp4`) are gitignored. Supply your own
-video; the model downloads on first run.
+Test footage (`*.mp4`) is gitignored. Supply your own video. The pipeline is pure
+OpenCV; no model download is required.
