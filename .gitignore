@@ -20,8 +20,12 @@ env/
 # Any stray docs/papers
 *.pdf
 
-# Tool output
-snapshots/
+# Tool output: ignore the snapshots folder except the two README examples.
+# (A file inside an ignored dir can't be re-included, so ignore contents with
+# snapshots/* and negate the specific files.)
+snapshots/*
+!snapshots/snap_20260717_214116_mosaic.png
+!snapshots/snap_20260717_214118_mosaic.png
 logs/
 
 # OS / editor
