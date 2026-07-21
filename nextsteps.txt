@@ -1,0 +1,7 @@
+Brief steps for the detection upgrade (when we do it)
+Point the tuner at the red captures + reconcile the config file (so tuning is fair and actually reaches the flight code).
+Fix morphology so it stops eating the ring and filling the hole (small kernel; preserve structure).
+Add a geometry stage: fit straight lines to the ring edges (or snake the colored bar) → require a convex 4-corner quad → corners = line intersections (survives breaks).
+Detect inner and outer as concentric quads; reject anything lacking that structure.
+PnP with known gate size → relative gate pose (center, distance, bearing) = the flight signal.
+Later: swap the classical corner finder for the NN keypoint detector.
