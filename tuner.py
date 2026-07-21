@@ -36,6 +36,43 @@ CONFIG_PATH = "gate_config.json"
 KEY_LEFT = 2424832
 KEY_RIGHT = 2555904
 
+# Color-pick: hue half-width set around a clicked pixel's hue.
+HUE_TOL = 10
+
+
+class FrameSource:
+    """Frames from a video file OR a folder of images (sorted by name). Lets the
+    tuner run on captured PNG frames, not just an .mp4."""
+    IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp")
+
+    def __init__(self, path):
+        self.is_dir = os.path.isdir(path)
+        if self.is_dir:
+            names = sorted(os.listdir(path))
+            self.paths = [os.path.join(path, n) for n in names
+                          if n.lower().endswith(self.IMG_EXT)]
+            self.count = len(self.paths)
+            print("Loaded %d image frames from %s" % (self.count, path))
+        else:
+            self.cap = cv2.VideoCapture(path)
+            ok = self.cap.isOpened()
+            self.count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) if ok else 0
+            if ok and self.count <= 0:
+                self.count = 1
+
+    def read(self, idx):
+        if self.is_dir:
+            if 0 <= idx < self.count:
+                img = cv2.imread(self.paths[idx])
+                return img is not None, img
+            return False, None
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        return self.cap.read()
+
+    def release(self):
+        if not self.is_dir:
+            self.cap.release()
+
 
 def conf_color(conf):
     """Confidence -> BGR color: green >0.8, yellow >0.5, else red."""
@@ -218,6 +255,18 @@ def build_zoom(result, detector, selected_idx):
     return cv2.hconcat([left, right])
 
 
+def build_color_view(result):
+    """'Dog vision': the color filter's output -- gate-colored pixels kept in full
+    color, everything else dimmed to gray. Click it to sample a hue into band A."""
+    proc = result["proc"]
+    mask = result["mask_raw"]
+    gray = cv2.cvtColor(cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    out = (gray * 0.35).astype(np.uint8)
+    out[mask > 0] = proc[mask > 0]
+    _label(out, "color filter: what the drone 'sees' (click a gate pixel to pick color)")
+    return out
+
+
 def _clamp(v, lo, hi):
     return max(lo, min(int(round(v)), hi))
 
@@ -225,23 +274,24 @@ def _clamp(v, lo, hi):
 def main():
     args = sys.argv[1:]
     if args:
-        video_path = args[0]
+        media_path = args[0]
     else:
         mp4s = sorted(glob.glob("*.mp4"))
         if not mp4s:
-            print("No video path given and no .mp4 found in current directory.")
+            print("Usage: tuner.py <video-file-or-image-folder> [config.json]")
             return
-        video_path = mp4s[0]
+        media_path = mp4s[0]
+    config_path = args[1] if len(args) > 1 else CONFIG_PATH
 
-    detector = GateDetector.from_config_file(CONFIG_PATH)
+    detector = GateDetector.from_config_file(config_path)
+    print("Editing config -> %s" % os.path.abspath(config_path))
+    print("Press 'w' to SAVE your changes to that file.")
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("Could not open video: %s" % video_path)
-        return
-    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    source = FrameSource(media_path)
+    count = source.count
     if count <= 0:
-        count = 1
+        print("Could not open: %s" % media_path)
+        return
 
     state = {
         "frame_idx": 0,
@@ -270,6 +320,9 @@ def main():
     cv2.moveWindow("gate zoom", 0, 600)
     cv2.moveWindow(WIN_COLOR, 1290, 0)
     cv2.moveWindow(WIN_SHAPE, 1290, 470)
+
+    cv2.namedWindow("color view", cv2.WINDOW_AUTOSIZE)
+    cv2.moveWindow("color view", 650, 600)
 
     tb_win = {}
 
@@ -332,6 +385,31 @@ def main():
     state["ready"] = True
     apply_controls()
 
+    def on_color_pick(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN or state["result"] is None:
+            return
+        r = state["result"]
+        hh, ss, vv = r["hsv_h"], r["hsv_s"], r["hsv_v"]
+        ph, pw = hh.shape[:2]
+        if not (0 <= x < pw and 0 <= y < ph):
+            return
+        h, s, v = int(hh[y, x]), int(ss[y, x]), int(vv[y, x])
+        lo, hi = max(0, h - HUE_TOL), min(180, h + HUE_TOL)
+        smin, vmin = max(0, s - 50), max(0, v - 60)
+        print("picked HSV=(%d,%d,%d) -> band A H[%d-%d] sat_min %d val_min %d"
+              % (h, s, v, lo, hi, smin, vmin))
+        cv2.setTrackbarPos("band_a_h_lo", tb_win["band_a_h_lo"], lo)
+        cv2.setTrackbarPos("band_a_h_hi", tb_win["band_a_h_hi"], hi)
+        cv2.setTrackbarPos("sat_min", tb_win["sat_min"], smin)
+        cv2.setTrackbarPos("val_min", tb_win["val_min"], vmin)
+        # Update the detector directly too, so the pick can't be lost if
+        # setTrackbarPos doesn't fire the slider callback on this OpenCV build.
+        detector.update(band_a_enabled=True, band_a_h_lo=lo, band_a_h_hi=hi,
+                        sat_min=smin, val_min=vmin)
+        state["dirty"] = True
+
+    cv2.setMouseCallback("color view", on_color_pick)
+
     def step(delta):
         ni = max(0, min(state["frame_idx"] + delta, count - 1))
         state["frame_idx"] = ni
@@ -365,8 +443,7 @@ def main():
 
     while True:
         if state["frame_changed"]:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, state["frame_idx"])
-            ok, frame = cap.read()
+            ok, frame = source.read(state["frame_idx"])
             if ok:
                 state["frame"] = frame
             state["frame_changed"] = False
@@ -380,6 +457,7 @@ def main():
             cv2.imshow("pipeline", build_mosaic(result, detector, state["selected_idx"],
                                                 state["frame_idx"], count))
             cv2.imshow("gate zoom", build_zoom(result, detector, state["selected_idx"]))
+            cv2.imshow("color view", build_color_view(result))
             state["dirty"] = False
 
         key = cv2.waitKeyEx(30)
@@ -410,8 +488,8 @@ def main():
                 detector.update(band_b_enabled=not detector.band_b_enabled)
                 state["dirty"] = True
             elif k == ord("w"):
-                detector.save_config(CONFIG_PATH)
-                print("Saved config to %s" % CONFIG_PATH)
+                detector.save_config(config_path)
+                print("SAVED config -> %s" % os.path.abspath(config_path))
             elif k == ord("s"):
                 snapshot()
             elif k == ord("q") or key == 27:
@@ -425,7 +503,7 @@ def main():
             else:
                 state["playing"] = False
 
-    cap.release()
+    source.release()
     cv2.destroyAllWindows()
 
 
